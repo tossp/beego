@@ -72,10 +72,30 @@ var (
 		"SetSecureCookie", "XsrfToken", "CheckXsrfCookie", "XsrfFormHtml",
 		"GetControllerAndAction"}
 
-	url_placeholder = "{{placeholder}}"
-
-	FilterRouterLog func(*beecontext.Context) bool
+	url_placeholder                = "{{placeholder}}"
+	DefaultLogFilter FilterHandler = &logFilter{}
 )
+
+type FilterHandler interface {
+	Filter(*beecontext.Context) bool
+}
+
+// default log filter static file will not show
+type logFilter struct {
+}
+
+func (l *logFilter) Filter(ctx *beecontext.Context) bool {
+	requestPath := path.Clean(ctx.Input.Request.URL.Path)
+	if requestPath == "/favicon.ico" || requestPath == "/robots.txt" {
+		return true
+	}
+	for prefix, _ := range StaticDir {
+		if strings.HasPrefix(requestPath, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // To append a slice's value into "exceptMethod", for controller's methods shouldn't reflect to AutoRouter
 func ExceptMethodAppend(action string) {
@@ -432,8 +452,8 @@ func (p *ControllerRegistor) UrlFor(endpoint string, values ...string) string {
 	}
 	controllName := strings.Join(paths[:len(paths)-1], "/")
 	methodName := paths[len(paths)-1]
-	for _, t := range p.routers {
-		ok, url := p.geturl(t, "/", controllName, methodName, params)
+	for m, t := range p.routers {
+		ok, url := p.geturl(t, "/", controllName, methodName, params, m)
 		if ok {
 			return url
 		}
@@ -441,17 +461,17 @@ func (p *ControllerRegistor) UrlFor(endpoint string, values ...string) string {
 	return ""
 }
 
-func (p *ControllerRegistor) geturl(t *Tree, url, controllName, methodName string, params map[string]string) (bool, string) {
+func (p *ControllerRegistor) geturl(t *Tree, url, controllName, methodName string, params map[string]string, httpMethod string) (bool, string) {
 	for k, subtree := range t.fixrouters {
 		u := path.Join(url, k)
-		ok, u := p.geturl(subtree, u, controllName, methodName, params)
+		ok, u := p.geturl(subtree, u, controllName, methodName, params, httpMethod)
 		if ok {
 			return ok, u
 		}
 	}
 	if t.wildcard != nil {
-		url = path.Join(url, url_placeholder)
-		ok, u := p.geturl(t.wildcard, url, controllName, methodName, params)
+		u := path.Join(url, url_placeholder)
+		ok, u := p.geturl(t.wildcard, u, controllName, methodName, params, httpMethod)
 		if ok {
 			return ok, u
 		}
@@ -471,8 +491,8 @@ func (p *ControllerRegistor) geturl(t *Tree, url, controllName, methodName strin
 					}
 				}
 				if !find {
-					for _, md := range c.methods {
-						if md == methodName {
+					for m, md := range c.methods {
+						if (m == "*" || m == httpMethod) && md == methodName {
 							find = true
 						}
 					}
@@ -624,7 +644,13 @@ func (p *ControllerRegistor) ServeHTTP(rw http.ResponseWriter, r *http.Request) 
 
 	// session init
 	if SessionOn {
-		context.Input.CruSession = GlobalSessions.SessionStart(w, r)
+		var err error
+		context.Input.CruSession, err = GlobalSessions.SessionStart(w, r)
+		if err != nil {
+			Error(err)
+			middleware.Exception("503", rw, r, "")
+			return
+		}
 		defer func() {
 			context.Input.CruSession.SessionRelease(w)
 		}()
@@ -648,7 +674,17 @@ func (p *ControllerRegistor) ServeHTTP(rw http.ResponseWriter, r *http.Request) 
 	}
 
 	if !findrouter {
-		if t, ok := p.routers[r.Method]; ok {
+		http_method := r.Method
+
+		if http_method == "POST" && context.Input.Query("_method") == "PUT" {
+			http_method = "PUT"
+		}
+
+		if http_method == "POST" && context.Input.Query("_method") == "DELETE" {
+			http_method = "DELETE"
+		}
+
+		if t, ok := p.routers[http_method]; ok {
 			runObject, p := t.Match(urlPath)
 			if r, ok := runObject.(*controllerInfo); ok {
 				routerInfo = r
@@ -805,7 +841,7 @@ Admin:
 		} else {
 			devinfo = fmt.Sprintf("| % -10s | % -40s | % -16s | % -10s |", r.Method, r.URL.Path, timeend.String(), "notmatch")
 		}
-		if FilterRouterLog == nil || !FilterRouterLog(context) {
+		if DefaultLogFilter == nil || !DefaultLogFilter.Filter(context) {
 			Debug(devinfo)
 		}
 	}
@@ -821,7 +857,9 @@ func (p *ControllerRegistor) recoverPanic(rw http.ResponseWriter, r *http.Reques
 		if err == USERSTOPRUN {
 			return
 		}
-		if _, ok := err.(middleware.HTTPException); ok {
+		if he, ok := err.(middleware.HTTPException); ok {
+			rw.WriteHeader(he.StatusCode)
+			rw.Write([]byte(he.Description))
 			// catch intented errors, only for HTTP 4XX and 5XX
 		} else {
 			if RunMode == "dev" {
@@ -853,9 +891,15 @@ func (p *ControllerRegistor) recoverPanic(rw http.ResponseWriter, r *http.Reques
 				} else {
 					// in production model show all infomation
 					if ErrorsShow {
-						handler := p.getErrorHandler(fmt.Sprint(err))
-						handler(rw, r)
-						return
+						if handler, ok := middleware.ErrorMaps[fmt.Sprint(err)]; ok {
+							handler(rw, r)
+							return
+						} else if handler, ok := middleware.ErrorMaps["503"]; ok {
+							handler(rw, r)
+							return
+						} else {
+							rw.Write([]byte(fmt.Sprint(err)))
+						}
 					} else {
 						Critical("the request url is ", r.URL.Path)
 						Critical("Handler crashed with error", err)
@@ -872,24 +916,6 @@ func (p *ControllerRegistor) recoverPanic(rw http.ResponseWriter, r *http.Reques
 
 		}
 	}
-}
-
-// there always should be error handler that sets error code accordingly for all unhandled errors.
-// in order to have custom UI for error page it's necessary to override "500" error.
-func (p *ControllerRegistor) getErrorHandler(errorCode string) func(rw http.ResponseWriter, r *http.Request) {
-	handler := middleware.SimpleServerError
-	ok := true
-	if errorCode != "" {
-		handler, ok = middleware.ErrorMaps[errorCode]
-		if !ok {
-			handler, ok = middleware.ErrorMaps["500"]
-		}
-		if !ok || handler == nil {
-			handler = middleware.SimpleServerError
-		}
-	}
-
-	return handler
 }
 
 //responseWriter is a wrapper for the http.ResponseWriter

@@ -40,6 +40,7 @@ var (
 	EnableHttpListen       bool
 	HttpAddr               string
 	HttpPort               int
+	ListenTCP4             bool
 	EnableHttpTLS          bool
 	HttpsPort              int
 	HttpCertFile           string
@@ -55,12 +56,11 @@ var (
 	SessionName            string           // the cookie name when saving session id into cookie.
 	SessionGCMaxLifetime   int64            // session gc time for auto cleaning expired session.
 	SessionSavePath        string           // if use mysql/redis/file provider, define save path to connection info.
-	SessionHashFunc        string           // session hash generation func.
-	SessionHashKey         string           // session hash salt string.
 	SessionCookieLifeTime  int              // the life time of session id in cookie.
 	SessionAutoSetCookie   bool             // auto setcookie
 	SessionDomain          string           // the cookie domain default is empty
 	UseFcgi                bool
+	UseStdIo               bool
 	MaxMemory              int64
 	EnableGzip             bool // flag of enable gzip
 	DirectoryIndex         bool // flag of display directory index. default is false.
@@ -87,13 +87,13 @@ type beegoAppConfig struct {
 	innerConfig config.ConfigContainer
 }
 
-func newAppConfig(AppConfigProvider, AppConfigPath string) *beegoAppConfig {
+func newAppConfig(AppConfigProvider, AppConfigPath string) (*beegoAppConfig, error) {
 	ac, err := config.NewConfig(AppConfigProvider, AppConfigPath)
 	if err != nil {
-		ac = config.NewFakeConfig()
+		return nil, err
 	}
 	rac := &beegoAppConfig{ac}
-	return rac
+	return rac, nil
 }
 
 func (b *beegoAppConfig) Set(key, val string) error {
@@ -235,12 +235,11 @@ func init() {
 	SessionName = "beegosessionID"
 	SessionGCMaxLifetime = 3600
 	SessionSavePath = ""
-	SessionHashFunc = "sha1"
-	SessionHashKey = "beegoserversessionkey"
 	SessionCookieLifeTime = 0 //set cookie default is the brower life
 	SessionAutoSetCookie = true
 
 	UseFcgi = false
+	UseStdIo = false
 
 	MaxMemory = 1 << 26 //64MB
 
@@ -275,19 +274,24 @@ func init() {
 	if err != nil {
 		fmt.Println("init console log error:", err)
 	}
+	SetLogFuncCall(true)
 
 	err = ParseConfig()
 	if err != nil && !os.IsNotExist(err) {
 		// for init if doesn't have app.conf will not panic
-		Info(err)
+		ac := config.NewFakeConfig()
+		AppConfig = &beegoAppConfig{ac}
+		Warning(err)
 	}
 }
 
 // ParseConfig parsed default config file.
 // now only support ini, next will support json.
 func ParseConfig() (err error) {
-	AppConfig = newAppConfig(AppConfigProvider, AppConfigPath)
-
+	AppConfig, err = newAppConfig(AppConfigProvider, AppConfigPath)
+	if err != nil {
+		return err
+	}
 	envRunMode := os.Getenv("BEEGO_RUNMODE")
 	// set the runmode first
 	if envRunMode != "" {
@@ -300,6 +304,10 @@ func ParseConfig() (err error) {
 
 	if v, err := AppConfig.Int("HttpPort"); err == nil {
 		HttpPort = v
+	}
+
+	if v, err := AppConfig.Bool("ListenTCP4"); err == nil {
+		ListenTCP4 = v
 	}
 
 	if v, err := AppConfig.Bool("EnableHttpListen"); err == nil {
@@ -340,14 +348,6 @@ func ParseConfig() (err error) {
 
 	if sesssavepath := AppConfig.String("SessionSavePath"); sesssavepath != "" {
 		SessionSavePath = sesssavepath
-	}
-
-	if sesshashfunc := AppConfig.String("SessionHashFunc"); sesshashfunc != "" {
-		SessionHashFunc = sesshashfunc
-	}
-
-	if sesshashkey := AppConfig.String("SessionHashKey"); sesshashkey != "" {
-		SessionHashKey = sesshashkey
 	}
 
 	if sessMaxLifeTime, err := AppConfig.Int64("SessionGCMaxLifetime"); err == nil && sessMaxLifeTime != 0 {
